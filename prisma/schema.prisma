@@ -1,0 +1,697 @@
+// BAYT-X — Database Schema (MVP V1)
+// من أول البحث... لحد المفتاح
+//
+// Design notes:
+// - Role-specific tables (BuyerProfile, SellerProfile, BrokerProfile, DeveloperProfile)
+//   are 1:1 extensions of User rather than separate identities, so one account
+//   can hold multiple roles (e.g. a Seller who is also a Buyer).
+// - Every verification-related status (property, legal, engineering) is modeled
+//   as its own status enum/table rather than a boolean — never collapse
+//   "verified" into true/false; it must always be traceable to *who* verified
+//   *what* and *when*.
+// - Offer/DealTimelineEvent rows are append-only. Never delete or overwrite —
+//   only insert new rows. This is what lets the platform reconstruct the full
+//   negotiation history later.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+
+enum Role {
+  USER
+  BUYER
+  TENANT
+  SELLER
+  BROKER
+  AGENCY
+  DEVELOPER
+  LAWYER
+  ENGINEER
+  PROPERTY_MANAGER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum PropertyPurpose {
+  SALE
+  RENT
+  BOTH
+}
+
+enum PropertyType {
+  APARTMENT
+  DUPLEX
+  VILLA
+  TOWNHOUSE
+  STUDIO
+  OFFICE
+  RETAIL
+  LAND
+}
+
+enum FinishLevel {
+  CORE_AND_SHELL
+  SEMI_FINISHED
+  FULLY_FINISHED
+  SUPER_LUX
+  ULTRA_LUX
+}
+
+enum PropertyStatus {
+  DRAFT
+  AVAILABLE
+  IN_NEGOTIATION
+  RESERVED
+  SOLD
+  RENTED
+  SUSPENDED
+}
+
+enum VerificationLevel {
+  UNVERIFIED
+  PARTIALLY_VERIFIED
+  VERIFIED
+}
+
+enum ReviewStatus {
+  NOT_STARTED
+  REQUESTED
+  ASSIGNED
+  IN_REVIEW
+  DOCUMENTS_MISSING
+  COMPLETED
+}
+
+enum LeadScore {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum ViewingStatus {
+  REQUESTED
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum OfferParty {
+  BUYER
+  SELLER
+}
+
+enum OfferStatus {
+  PENDING
+  COUNTERED
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+enum DealStatus {
+  NEGOTIATION
+  OFFER_ACCEPTED
+  LEGAL_REVIEW
+  ENGINEERING_REVIEW
+  CLOSING
+  CLOSED
+  CANCELLED
+}
+
+enum DealRole {
+  BUYER
+  SELLER
+  BROKER
+  LAWYER
+  ENGINEER
+}
+
+enum SwapStatus {
+  OPEN
+  MATCHED
+  NEGOTIATING
+  CLOSED
+  CANCELLED
+}
+
+enum PaymentPurpose {
+  VERIFICATION_FEE
+  LISTING_FEE
+  SUBSCRIPTION
+  COMMISSION
+  INSPECTION_FEE
+  LEGAL_FEE
+  RENT
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum SubscriptionPlan {
+  FREE
+  PRO
+  AGENCY
+  ENTERPRISE
+}
+
+enum NotificationType {
+  NEW_OFFER
+  COUNTER_OFFER
+  VIEWING_REQUEST
+  VIEWING_CONFIRMED
+  DOCUMENT_UPLOADED
+  VERIFICATION_COMPLETE
+  DEAL_UPDATE
+  MESSAGE
+  PAYMENT_REMINDER
+  RENT_REMINDER
+}
+
+// ---------------------------------------------------------------------------
+// USERS & ROLE PROFILES
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(cuid())
+  fullName      String
+  email         String   @unique
+  phone         String   @unique
+  passwordHash  String
+  roles         Role[]   @default([USER])
+  avatarUrl     String?
+  isPhoneVerified Boolean @default(false)
+  isEmailVerified Boolean @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  buyerProfile     BuyerProfile?
+  sellerProfile    SellerProfile?
+  brokerProfile    BrokerProfile?
+  developerProfile DeveloperProfile?
+
+  propertiesOwned  Property[]        @relation("PropertyOwner")
+  leadsAsBuyer     Lead[]            @relation("LeadBuyer")
+  leadsAssigned    Lead[]            @relation("LeadBroker")
+  viewingsRequested Viewing[]        @relation("ViewingRequester")
+  dealParticipants DealParticipant[]
+  messagesSent     DealMessage[]
+  notifications    Notification[]
+  favorites        Favorite[]
+  reviewsWritten   Review[]          @relation("ReviewAuthor")
+  payments         Payment[]
+  subscriptions    Subscription[]
+  auditLogs        AuditLog[]
+
+  @@index([email])
+  @@index([phone])
+}
+
+model BuyerProfile {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isPhoneVerified   Boolean  @default(false)
+  isIdVerified      Boolean  @default(false)
+  isFinanciallyVerified Boolean @default(false)
+  verifiedBuyerAt   DateTime?
+  preferredAreas    String[]
+  maxBudget         Decimal? @db.Decimal(14, 2)
+  createdAt         DateTime @default(now())
+}
+
+model SellerProfile {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isVerified Boolean @default(false)
+  createdAt DateTime @default(now())
+}
+
+model BrokerProfile {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agencyName   String?
+  licenseNumber String?
+  commissionRate Decimal @default(2.5) @db.Decimal(5, 2)
+  createdAt    DateTime @default(now())
+}
+
+model DeveloperProfile {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyName String
+  createdAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// PROPERTIES
+// ---------------------------------------------------------------------------
+
+model Property {
+  id            String          @id @default(cuid())
+  referenceCode String          @unique // e.g. PROP-000451
+  ownerId       String
+  owner         User            @relation("PropertyOwner", fields: [ownerId], references: [id])
+  assignedBrokerId String?
+
+  title         String
+  description   String
+  purpose       PropertyPurpose
+  type          PropertyType
+  status        PropertyStatus  @default(DRAFT)
+
+  price         Decimal         @db.Decimal(14, 2)
+  currency      String          @default("EGP")
+  areaSqm       Decimal         @db.Decimal(8, 2)
+  bedrooms      Int
+  bathrooms     Int
+  floor         String?
+  finishLevel   FinishLevel
+  buildYear     Int?
+
+  verificationLevel VerificationLevel @default(UNVERIFIED)
+  fingerprint   String?         // for duplicate detection: hash of location+area+rooms+owner
+
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  priceUpdatedAt DateTime       @default(now())
+  availabilityUpdatedAt DateTime @default(now())
+
+  location      PropertyLocation?
+  images        PropertyImage[]
+  documents     PropertyDocument[]
+  features      PropertyFeature[]
+  verifications PropertyVerification[]
+  leads         Lead[]
+  viewings      Viewing[]
+  deals         Deal[]
+  inspections   Inspection[]
+  legalReviews  LegalReview[]
+  valuations    Valuation[]
+  favorites     Favorite[]
+  reviews       Review[]
+  rental        Rental?
+  swapsAsSource PropertySwap[]  @relation("SwapSource")
+  swapsAsTarget PropertySwap[]  @relation("SwapTarget")
+
+  @@index([status])
+  @@index([type])
+  @@index([verificationLevel])
+  @@index([price])
+}
+
+model PropertyLocation {
+  id         String   @id @default(cuid())
+  propertyId String   @unique
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  city       String
+  district   String
+  addressLine String?
+  latitude   Float
+  longitude  Float
+}
+
+model PropertyImage {
+  id         String   @id @default(cuid())
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  url        String
+  isCover    Boolean  @default(false)
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+}
+
+model PropertyDocument {
+  id         String   @id @default(cuid())
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  type       String   // ownership_contract | national_id | tax_receipt | power_of_attorney ...
+  fileUrl    String
+  uploadedById String
+  createdAt  DateTime @default(now())
+}
+
+model PropertyFeature {
+  id         String   @id @default(cuid())
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  key        String   // e.g. "elevator", "parking", "near_metro"
+  value      String   // e.g. "true", "2 spots"
+
+  @@unique([propertyId, key])
+}
+
+// Append-only trail of verification workflow transitions for a property.
+// Current summarized state lives on Property.verificationLevel; this table
+// is the audit trail of how it got there (who moved it, and when).
+model PropertyVerification {
+  id         String       @id @default(cuid())
+  propertyId String
+  property   Property     @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  status     ReviewStatus @default(REQUESTED)
+  reviewedById String?
+  notes      String?
+  createdAt  DateTime     @default(now())
+}
+
+model Favorite {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, propertyId])
+}
+
+// ---------------------------------------------------------------------------
+// LEADS / CRM
+// ---------------------------------------------------------------------------
+
+model Lead {
+  id            String    @id @default(cuid())
+  referenceCode String    @unique // e.g. LEAD-0091
+  buyerId       String
+  buyer         User      @relation("LeadBuyer", fields: [buyerId], references: [id])
+  brokerId      String?
+  broker        User?     @relation("LeadBroker", fields: [brokerId], references: [id])
+  propertyId    String?
+  property      Property? @relation(fields: [propertyId], references: [id])
+
+  source        String    @default("platform") // platform | referral | ad_campaign ...
+  budgetMin     Decimal?  @db.Decimal(14, 2)
+  budgetMax     Decimal?  @db.Decimal(14, 2)
+  preferredAreas String[]
+  propertyType  PropertyType?
+  score         LeadScore @default(MEDIUM)
+  lastContactAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  viewings      Viewing[]
+  offers        Offer[]
+
+  @@index([brokerId])
+  @@index([score])
+}
+
+// ---------------------------------------------------------------------------
+// VIEWINGS
+// ---------------------------------------------------------------------------
+
+model Viewing {
+  id           String        @id @default(cuid())
+  propertyId   String
+  property     Property      @relation(fields: [propertyId], references: [id])
+  requesterId  String
+  requester    User          @relation("ViewingRequester", fields: [requesterId], references: [id])
+  leadId       String?
+  lead         Lead?         @relation(fields: [leadId], references: [id])
+  scheduledAt  DateTime
+  status       ViewingStatus @default(REQUESTED)
+  notes        String?
+  createdAt    DateTime      @default(now())
+
+  @@index([propertyId])
+  @@index([scheduledAt])
+}
+
+// ---------------------------------------------------------------------------
+// OFFERS / DEAL ROOM
+// ---------------------------------------------------------------------------
+
+model Deal {
+  id            String   @id @default(cuid())
+  referenceCode String   @unique // e.g. DEAL-000124
+  propertyId    String
+  property      Property @relation(fields: [propertyId], references: [id])
+  status        DealStatus @default(NEGOTIATION)
+  agreedPrice   Decimal? @db.Decimal(14, 2)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  participants  DealParticipant[]
+  offers        Offer[]
+  messages      DealMessage[]
+  documents     DealDocument[]
+  timeline      DealTimelineEvent[]
+  legalReviews  LegalReview[]
+  inspections   Inspection[]
+
+  @@index([status])
+}
+
+model DealParticipant {
+  id      String   @id @default(cuid())
+  dealId  String
+  deal    Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  userId  String
+  user    User     @relation(fields: [userId], references: [id])
+  role    DealRole
+
+  @@unique([dealId, userId, role])
+}
+
+// Append-only. Never update or delete a row — a correction is a new Offer.
+model Offer {
+  id         String      @id @default(cuid())
+  dealId     String
+  deal       Deal        @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  leadId     String?
+  lead       Lead?       @relation(fields: [leadId], references: [id])
+  madeBy     OfferParty
+  amount     Decimal     @db.Decimal(14, 2)
+  status     OfferStatus @default(PENDING)
+  createdAt  DateTime    @default(now())
+
+  @@index([dealId])
+}
+
+model DealMessage {
+  id        String   @id @default(cuid())
+  dealId    String
+  deal      Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  senderId  String
+  sender    User     @relation(fields: [senderId], references: [id])
+  body      String?
+  attachmentUrl String?
+  createdAt DateTime @default(now())
+
+  @@index([dealId])
+}
+
+model DealDocument {
+  id         String   @id @default(cuid())
+  dealId     String
+  deal       Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  type       String
+  fileUrl    String
+  uploadedById String
+  createdAt  DateTime @default(now())
+}
+
+// Append-only audit trail of everything that happens in a Deal Room —
+// this is what "Deal Readiness %" and the funnel reporting are computed from.
+model DealTimelineEvent {
+  id        String   @id @default(cuid())
+  dealId    String
+  deal      Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  type      String   // offer_made | counter_offer | accepted | rejected | legal_requested | inspection_completed ...
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  @@index([dealId])
+}
+
+// ---------------------------------------------------------------------------
+// LEGAL / ENGINEERING / VALUATION
+// ---------------------------------------------------------------------------
+
+model LegalReview {
+  id          String       @id @default(cuid())
+  propertyId  String
+  property    Property     @relation(fields: [propertyId], references: [id])
+  dealId      String?
+  deal        Deal?        @relation(fields: [dealId], references: [id])
+  status      ReviewStatus @default(NOT_STARTED)
+  assignedLawyerId String?
+  findings    String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+model Inspection {
+  id          String       @id @default(cuid())
+  propertyId  String
+  property    Property     @relation(fields: [propertyId], references: [id])
+  dealId      String?
+  deal        Deal?        @relation(fields: [dealId], references: [id])
+  status      ReviewStatus @default(NOT_STARTED)
+  assignedEngineerId String?
+  // Free-form checklist result, e.g. { electricity: "ok", plumbing: "needs_repair", cracks: "none" }
+  reportJson  Json?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+// AI-assisted estimate only — never a substitute for LegalReview/Inspection or
+// an official appraisal. Always surfaced to users with an explicit disclaimer.
+model Valuation {
+  id          String   @id @default(cuid())
+  propertyId  String
+  property    Property @relation(fields: [propertyId], references: [id])
+  estimatedMin Decimal @db.Decimal(14, 2)
+  estimatedMax Decimal @db.Decimal(14, 2)
+  modelVersion String  @default("mock-v1")
+  createdAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// SWAP / SELL-BUY CHAIN
+// ---------------------------------------------------------------------------
+
+model PropertySwap {
+  id             String     @id @default(cuid())
+  sourcePropertyId String
+  sourceProperty Property   @relation("SwapSource", fields: [sourcePropertyId], references: [id])
+  targetPropertyId String?
+  targetProperty Property?  @relation("SwapTarget", fields: [targetPropertyId], references: [id])
+  cashDifference Decimal?   @db.Decimal(14, 2)
+  status         SwapStatus @default(OPEN)
+  createdAt      DateTime   @default(now())
+}
+
+// Links a "sell my place, then buy a new one" pair of deals together so both
+// can be tracked and reported on as a single transaction chain.
+model TransactionChain {
+  id          String   @id @default(cuid())
+  sellDealId  String?  @unique
+  buyDealId   String?  @unique
+  createdAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// RENTALS / PROPERTY MANAGEMENT
+// ---------------------------------------------------------------------------
+
+model Rental {
+  id           String   @id @default(cuid())
+  propertyId   String   @unique
+  property     Property @relation(fields: [propertyId], references: [id])
+  monthlyRent  Decimal  @db.Decimal(12, 2)
+  startDate    DateTime
+  endDate      DateTime?
+  isFurnished  Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  tenants      Tenant[]
+}
+
+model Tenant {
+  id         String   @id @default(cuid())
+  rentalId   String
+  rental     Rental   @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+  fullName   String
+  phone      String
+  contractUrl String?
+  createdAt  DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// PAYMENTS / SUBSCRIPTIONS
+// ---------------------------------------------------------------------------
+
+// Wraps whatever real payment gateway is plugged in later via PaymentProvider.
+// Never stores card numbers or other sensitive card data — only the
+// gateway's own transaction reference.
+model Payment {
+  id             String         @id @default(cuid())
+  userId         String
+  user           User           @relation(fields: [userId], references: [id])
+  purpose        PaymentPurpose
+  amount         Decimal        @db.Decimal(12, 2)
+  currency       String         @default("EGP")
+  status         PaymentStatus  @default(PENDING)
+  providerRef    String?        // external gateway's transaction id
+  createdAt      DateTime       @default(now())
+}
+
+model Subscription {
+  id         String           @id @default(cuid())
+  userId     String
+  user       User             @relation(fields: [userId], references: [id])
+  plan       SubscriptionPlan @default(FREE)
+  startedAt  DateTime         @default(now())
+  renewsAt   DateTime?
+  isActive   Boolean          @default(true)
+}
+
+// ---------------------------------------------------------------------------
+// NOTIFICATIONS / REVIEWS / MODERATION
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String            @id @default(cuid())
+  userId    String
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime          @default(now())
+
+  @@index([userId, readAt])
+}
+
+model Review {
+  id         String   @id @default(cuid())
+  authorId   String
+  author     User     @relation("ReviewAuthor", fields: [authorId], references: [id])
+  propertyId String?
+  property   Property? @relation(fields: [propertyId], references: [id])
+  rating     Int      // 1-5
+  comment    String?
+  createdAt  DateTime @default(now())
+}
+
+// Flags raised by moderation rules or admins — duplicate listings, spam,
+// misleading prices, etc. Kept separate from AuditLog (system-of-record
+// for *actions*) because Reports are about *content quality*.
+model Report {
+  id         String   @id @default(cuid())
+  propertyId String?
+  reason     String   // duplicate | spam | scam | misleading_price | other
+  details    String?
+  status     String   @default("open") // open | reviewing | resolved | dismissed
+  createdAt  DateTime @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  actor     User?    @relation(fields: [actorId], references: [id])
+  action    String   // e.g. "property.status_changed", "offer.accepted"
+  entity    String   // e.g. "Property", "Deal"
+  entityId  String
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+}
