@@ -5,6 +5,7 @@
   "description": "BAYT-X — منصة عقارية متكاملة للسوق المصري (MVP V1)",
   "scripts": {
     "dev": "next dev",
+    "postinstall": "prisma generate",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
